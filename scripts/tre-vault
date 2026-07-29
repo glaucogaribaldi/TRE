@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VAULT_DIR="/var/lib/tre/vault"
+VAULT_FILE="$VAULT_DIR/secrets.json.age"
+KEY_FILE="/etc/tre/age.key"
+AUDIT_FILE="/var/log/tre/vault-audit.jsonl"
+LOCK_FILE="/run/lock/tre-vault.lock"
+
+fail(){ echo "ERRORE: $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || fail "Comando mancante: $1"; }
+
+need age
+need jq
+need flock
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || fail "Usa sudo tre-vault ..."
+[[ -r "$KEY_FILE" ]] || fail "Chiave vault non trovata: $KEY_FILE"
+mkdir -p "$VAULT_DIR" "$(dirname "$AUDIT_FILE")"
+touch "$AUDIT_FILE"
+chmod 700 "$VAULT_DIR"
+chmod 600 "$KEY_FILE" "$AUDIT_FILE"
+
+exec 9>"$LOCK_FILE"
+flock -x 9
+
+audit(){
+  local action="$1" key="${2:-}" result="${3:-ok}"
+  jq -cn --arg ts "$(date --iso-8601=seconds)" --arg actor "${SUDO_USER:-root}" --arg action "$action" --arg key "$key" --arg result "$result" \
+    '{timestamp:$ts,actor:$actor,action:$action,key:$key,result:$result}' >> "$AUDIT_FILE"
+}
+
+decrypt_to(){
+  local out="$1"
+  if [[ -s "$VAULT_FILE" ]]; then
+    age --decrypt -i "$KEY_FILE" -o "$out" "$VAULT_FILE"
+  else
+    printf '{"version":1,"updated_at":null,"secrets":{}}\n' > "$out"
+  fi
+}
+
+encrypt_from(){
+  local src="$1" pub tmp
+  pub="$(age-keygen -y "$KEY_FILE")"
+  tmp="${VAULT_FILE}.tmp"
+  age --encrypt -r "$pub" -o "$tmp" "$src"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$VAULT_FILE"
+}
+
+validate_key(){
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]] || fail "Nome chiave non valido"
+}
+
+cmd="${1:-help}"
+case "$cmd" in
+  init)
+    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; trap 'shred -u "$tmp" 2>/dev/null || rm -f "$tmp"' EXIT
+    decrypt_to "$tmp"; encrypt_from "$tmp"; audit init
+    echo "Vault TRE inizializzato: $VAULT_FILE"
+    ;;
+  set)
+    key="${2:-}"; validate_key "$key"
+    value="${3:-}"
+    if [[ -z "$value" ]]; then IFS= read -r -s -p "Valore per $key: " value; echo; fi
+    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; out="$(mktemp /dev/shm/tre-vault.XXXXXX)"
+    trap 'shred -u "$tmp" "$out" 2>/dev/null || rm -f "$tmp" "$out"' EXIT
+    decrypt_to "$tmp"
+    jq --arg k "$key" --arg v "$value" --arg ts "$(date --iso-8601=seconds)" '.updated_at=$ts | .secrets[$k]={value:$v,updated_at:$ts}' "$tmp" > "$out"
+    encrypt_from "$out"; audit set "$key"
+    echo "Salvato: $key"
+    ;;
+  set-file)
+    key="${2:-}"; file="${3:-}"; validate_key "$key"; [[ -r "$file" ]] || fail "File non leggibile: $file"
+    value="$(base64 -w0 "$file")"
+    "$0" set "$key" "$value"
+    ;;
+  get)
+    key="${2:-}"; validate_key "$key"
+    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; trap 'shred -u "$tmp" 2>/dev/null || rm -f "$tmp"' EXIT
+    decrypt_to "$tmp"
+    jq -er --arg k "$key" '.secrets[$k].value' "$tmp" || fail "Chiave non trovata: $key"
+    audit get "$key"
+    ;;
+  export-file)
+    key="${2:-}"; dest="${3:-}"; [[ -n "$dest" ]] || fail "Destinazione mancante"
+    "$0" get "$key" | base64 -d > "$dest"; chmod 600 "$dest"; audit export-file "$key"
+    ;;
+  list)
+    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; trap 'shred -u "$tmp" 2>/dev/null || rm -f "$tmp"' EXIT
+    decrypt_to "$tmp"; jq -r '.secrets | keys[]' "$tmp"; audit list
+    ;;
+  delete)
+    key="${2:-}"; validate_key "$key"
+    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; out="$(mktemp /dev/shm/tre-vault.XXXXXX)"
+    trap 'shred -u "$tmp" "$out" 2>/dev/null || rm -f "$tmp" "$out"' EXIT
+    decrypt_to "$tmp"; jq --arg k "$key" --arg ts "$(date --iso-8601=seconds)" 'del(.secrets[$k]) | .updated_at=$ts' "$tmp" > "$out"
+    encrypt_from "$out"; audit delete "$key"; echo "Eliminato: $key"
+    ;;
+  help|*)
+    cat <<'EOF'
+Uso:
+  sudo tre-vault init
+  sudo tre-vault set NOME [VALORE]
+  sudo tre-vault set-file NOME /percorso/file
+  sudo tre-vault get NOME
+  sudo tre-vault export-file NOME /destinazione
+  sudo tre-vault list
+  sudo tre-vault delete NOME
+
+Esempi per TRE/OpenClaw:
+  sudo tre-vault set telegram.bot_token
+  sudo tre-vault set vps.nome.ip 100.64.0.10
+  sudo tre-vault set-file vps.nome.ssh_private_key ~/.ssh/id_ed25519
+EOF
+    ;;
+esac
