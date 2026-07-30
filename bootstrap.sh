@@ -70,7 +70,10 @@ fi
 
 log "Installazione vault cifrato TRE"
 sudo install -d -m 700 /etc/tre /var/lib/tre/vault /var/log/tre
-if [[ ! -s /etc/tre/age.key ]]; then
+if [[ -e /etc/tre/age.key && ! -s /etc/tre/age.key ]]; then
+  sudo rm -f /etc/tre/age.key
+fi
+if [[ ! -e /etc/tre/age.key ]]; then
   sudo age-keygen -o /etc/tre/age.key
 fi
 sudo chmod 600 /etc/tre/age.key
