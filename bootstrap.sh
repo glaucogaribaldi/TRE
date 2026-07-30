@@ -19,7 +19,7 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   git curl wget ca-certificates gnupg lsb-release jq age zenity \
   openssh-client openssh-server ufw xrdp xfce4 xfce4-goodies \
-  dbus-x11 policykit-1 build-essential python3 python3-venv python3-pip \
+  dbus-x11 polkitd pkexec build-essential python3 python3-venv python3-pip \
   sqlite3 postgresql-client redis-tools htop btop tmux unzip zip rsync \
   net-tools dnsutils ripgrep fd-find acl fail2ban
 
