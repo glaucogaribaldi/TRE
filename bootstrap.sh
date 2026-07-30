@@ -84,9 +84,13 @@ sudo chmod 440 /etc/sudoers.d/90-tre-openclaw
 sudo visudo -cf /etc/sudoers.d/90-tre-openclaw >/dev/null
 
 log "Installazione OpenClaw ufficiale"
+export PATH="$HOME/.npm-global/bin:$PATH"
 if ! command -v openclaw >/dev/null 2>&1; then
   curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-onboard
+  export PATH="$HOME/.npm-global/bin:$PATH"
+  hash -r
 fi
+command -v openclaw >/dev/null 2>&1 || fail "OpenClaw installato ma non disponibile nel PATH"
 
 log "Creazione workspace e identità TRE"
 mkdir -p "$HOME/.openclaw/workspace" "$HOME/.config/tre" "$HOME/tre-data"/{postgres,redis,qdrant,backups,logs}
@@ -103,7 +107,12 @@ cat > "$HOME/.config/tre/config.json" <<EOF
   "vault_command": "sudo /usr/local/bin/tre-vault",
   "remote_desktop": {"protocol":"RDP","port":3389,"network":"tailscale-only"},
   "model_router": {"primary":"gemini","alternatives":["nemotron"]},
-  "memory": {"phase":1,"postgres":true,"redis":true,"qdrant":true}
+  "memory": {
+    "phase":1,
+    "postgres":{"host":"127.0.0.1","port":55432},
+    "redis":{"host":"127.0.0.1","port":56379},
+    "qdrant":{"host":"127.0.0.1","port":56333}
+  }
 }
 EOF
 chmod 600 "$HOME/.config/tre/config.json"
@@ -121,7 +130,7 @@ services:
     volumes:
       - ${HOME}/tre-data/postgres:/var/lib/postgresql/data
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:55432:5432"
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -129,17 +138,18 @@ services:
     volumes:
       - ${HOME}/tre-data/redis:/data
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:56379:6379"
   qdrant:
     image: qdrant/qdrant:latest
     restart: unless-stopped
     volumes:
       - ${HOME}/tre-data/qdrant:/qdrant/storage
     ports:
-      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:56333:6333"
 EOF
 
-docker compose -f "$HOME/TRE/docker-compose.core.yml" up -d || sudo docker compose -f "$HOME/TRE/docker-compose.core.yml" up -d
+sudo docker compose -f "$HOME/TRE/docker-compose.core.yml" down --remove-orphans || true
+sudo docker compose -f "$HOME/TRE/docker-compose.core.yml" up -d
 
 log "Configurazione grafica di credenziali e VPS"
 /usr/local/bin/tre-secrets-gui
@@ -158,4 +168,7 @@ echo "Windows App / RDP: ${TS_IP:-IP_TAILSCALE}:3389"
 echo "Dashboard OpenClaw locale: http://127.0.0.1:18789/"
 echo "Repository locale: $INSTALL_DIR"
 echo "Vault: sudo tre-vault help"
+echo "PostgreSQL TRE: 127.0.0.1:55432"
+echo "Redis TRE: 127.0.0.1:56379"
+echo "Qdrant TRE: 127.0.0.1:56333"
 echo "Nota: esegui logout/login una volta per applicare il gruppo Docker."
