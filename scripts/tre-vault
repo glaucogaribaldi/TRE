@@ -9,13 +9,15 @@ LOCK_FILE="/run/lock/tre-vault.lock"
 
 fail(){ echo "ERRORE: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || fail "Comando mancante: $1"; }
+cleanup_file(){ [[ -n "${1:-}" && -e "${1:-}" ]] && { shred -u "$1" 2>/dev/null || rm -f "$1"; }; }
 
 need age
+need age-keygen
 need jq
 need flock
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || fail "Usa sudo tre-vault ..."
-[[ -r "$KEY_FILE" ]] || fail "Chiave vault non trovata: $KEY_FILE"
+[[ -s "$KEY_FILE" ]] || fail "Chiave vault assente o vuota: $KEY_FILE"
 mkdir -p "$VAULT_DIR" "$(dirname "$AUDIT_FILE")"
 touch "$AUDIT_FILE"
 chmod 700 "$VAULT_DIR"
@@ -30,6 +32,13 @@ audit(){
     '{timestamp:$ts,actor:$actor,action:$action,key:$key,result:$result}' >> "$AUDIT_FILE"
 }
 
+recipient(){
+  local pub
+  pub="$(age-keygen -y "$KEY_FILE" 2>/dev/null)" || fail "Chiave age non valida: $KEY_FILE"
+  [[ "$pub" == age1* ]] || fail "Recipient age non valido derivato dalla chiave"
+  printf '%s\n' "$pub"
+}
+
 decrypt_to(){
   local out="$1"
   if [[ -s "$VAULT_FILE" ]]; then
@@ -40,12 +49,20 @@ decrypt_to(){
 }
 
 encrypt_from(){
-  local src="$1" pub tmp
-  pub="$(age-keygen -y "$KEY_FILE")"
-  tmp="${VAULT_FILE}.tmp"
+  local src="$1" pub tmp verify
+  pub="$(recipient)"
+  tmp="${VAULT_FILE}.tmp.$$"
+  verify="$(mktemp /dev/shm/tre-vault-verify.XXXXXX)"
+  trap 'cleanup_file "${tmp:-}"; cleanup_file "${verify:-}"' RETURN
+
   age --encrypt -r "$pub" -o "$tmp" "$src"
   chmod 600 "$tmp"
+  age --decrypt -i "$KEY_FILE" -o "$verify" "$tmp"
+  jq -e '.version == 1 and (.secrets | type == "object")' "$verify" >/dev/null || fail "Verifica vault fallita"
   mv -f "$tmp" "$VAULT_FILE"
+  chmod 600 "$VAULT_FILE"
+  cleanup_file "$verify"
+  trap - RETURN
 }
 
 validate_key(){
@@ -55,16 +72,38 @@ validate_key(){
 cmd="${1:-help}"
 case "$cmd" in
   init)
-    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; trap 'shred -u "$tmp" 2>/dev/null || rm -f "$tmp"' EXIT
-    decrypt_to "$tmp"; encrypt_from "$tmp"; audit init
-    echo "Vault TRE inizializzato: $VAULT_FILE"
+    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"
+    trap 'cleanup_file "${tmp:-}"' EXIT
+
+    if [[ -s "$VAULT_FILE" ]]; then
+      if ! age --decrypt -i "$KEY_FILE" -o "$tmp" "$VAULT_FILE" 2>/dev/null; then
+        backup="${VAULT_FILE}.unreadable-$(date +%Y%m%d-%H%M%S)"
+        mv "$VAULT_FILE" "$backup"
+        chmod 600 "$backup"
+        audit init "" "recovered-unreadable-vault"
+        printf '{"version":1,"updated_at":null,"secrets":{}}\n' > "$tmp"
+        echo "Vault precedente incompatibile conservato in: $backup"
+      fi
+    else
+      printf '{"version":1,"updated_at":null,"secrets":{}}\n' > "$tmp"
+    fi
+
+    jq -e '.version == 1 and (.secrets | type == "object")' "$tmp" >/dev/null || {
+      backup="${VAULT_FILE}.invalid-$(date +%Y%m%d-%H%M%S)"
+      [[ -e "$VAULT_FILE" ]] && mv "$VAULT_FILE" "$backup"
+      printf '{"version":1,"updated_at":null,"secrets":{}}\n' > "$tmp"
+    }
+
+    encrypt_from "$tmp"
+    audit init
+    echo "Vault TRE inizializzato e verificato: $VAULT_FILE"
     ;;
   set)
     key="${2:-}"; validate_key "$key"
     value="${3:-}"
     if [[ -z "$value" ]]; then IFS= read -r -s -p "Valore per $key: " value; echo; fi
     tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; out="$(mktemp /dev/shm/tre-vault.XXXXXX)"
-    trap 'shred -u "$tmp" "$out" 2>/dev/null || rm -f "$tmp" "$out"' EXIT
+    trap 'cleanup_file "${tmp:-}"; cleanup_file "${out:-}"' EXIT
     decrypt_to "$tmp"
     jq --arg k "$key" --arg v "$value" --arg ts "$(date --iso-8601=seconds)" '.updated_at=$ts | .secrets[$k]={value:$v,updated_at:$ts}' "$tmp" > "$out"
     encrypt_from "$out"; audit set "$key"
@@ -77,7 +116,7 @@ case "$cmd" in
     ;;
   get)
     key="${2:-}"; validate_key "$key"
-    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; trap 'shred -u "$tmp" 2>/dev/null || rm -f "$tmp"' EXIT
+    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; trap 'cleanup_file "${tmp:-}"' EXIT
     decrypt_to "$tmp"
     jq -er --arg k "$key" '.secrets[$k].value' "$tmp" || fail "Chiave non trovata: $key"
     audit get "$key"
@@ -87,13 +126,13 @@ case "$cmd" in
     "$0" get "$key" | base64 -d > "$dest"; chmod 600 "$dest"; audit export-file "$key"
     ;;
   list)
-    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; trap 'shred -u "$tmp" 2>/dev/null || rm -f "$tmp"' EXIT
+    tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; trap 'cleanup_file "${tmp:-}"' EXIT
     decrypt_to "$tmp"; jq -r '.secrets | keys[]' "$tmp"; audit list
     ;;
   delete)
     key="${2:-}"; validate_key "$key"
     tmp="$(mktemp /dev/shm/tre-vault.XXXXXX)"; out="$(mktemp /dev/shm/tre-vault.XXXXXX)"
-    trap 'shred -u "$tmp" "$out" 2>/dev/null || rm -f "$tmp" "$out"' EXIT
+    trap 'cleanup_file "${tmp:-}"; cleanup_file "${out:-}"' EXIT
     decrypt_to "$tmp"; jq --arg k "$key" --arg ts "$(date --iso-8601=seconds)" 'del(.secrets[$k]) | .updated_at=$ts' "$tmp" > "$out"
     encrypt_from "$out"; audit delete "$key"; echo "Eliminato: $key"
     ;;
